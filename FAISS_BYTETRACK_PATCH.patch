@@ -1,0 +1,138 @@
+--- test.py	2026-04-13
++++ test.py.new	2026-04-13
+@@ -41,12 +41,40 @@
+     with open(DB_FILE, 'wb') as f:
+         pickle.dump(daily_identity_db, f)
++    # Update faiss when DB changes
++    build_faiss_indexes()
+ 
++face_index = None
++clothes_index = None
++face_id_map = []
++clothes_id_map = []
++
++def build_faiss_indexes():
++    global face_index, clothes_index, face_id_map, clothes_id_map
++    face_vecs = []
++    face_id_map = []
++    cloth_vecs = []
++    clothes_id_map = []
++    for cid, data in daily_identity_db.items():
++        for fv in data['face_features']:
++            face_vecs.append(fv)
++            face_id_map.append(cid)
++        for cv in data['clothes_features']:
++            cloth_vecs.append(cv)
++            clothes_id_map.append(cid)
++    if face_vecs:
++        dim = len(face_vecs[0])
++        face_index = faiss.IndexFlatIP(dim)
++        face_index.add(np.array(face_vecs, dtype=np.float32))
++    else:
++        face_index = None
++    if cloth_vecs:
++        dim = len(cloth_vecs[0])
++        clothes_index = faiss.IndexFlatIP(dim)
++        clothes_index.add(np.array(cloth_vecs, dtype=np.float32))
++    else:
++        clothes_index = None
++
++build_faiss_indexes()
++
+ detection_queue = queue.Queue(maxsize=3)
+ analysis_queue = queue.Queue()
+@@ -58,7 +86,7 @@
+         tid, raw_frame = task
+         
+-        body_results = body_model.predict(raw_frame, classes=[0], conf=0.50, imgsz=320, verbose=False)
++        body_results = body_model.track(raw_frame, classes=[0], conf=0.50, imgsz=320, persist=True, tracker="bytetrack.yaml", verbose=False)
+         face_results = face_model.predict(raw_frame, conf=0.50, imgsz=320, verbose=False)
+         
+@@ -70,6 +98,8 @@
+         for r in body_results:
+             for box in r.boxes:
++                tid_out = int(box.id[0]) if box.id is not None else None
++                if tid_out is None: continue
++
+                 bx1, by1, bx2, by2 = map(int, box.xyxy[0])
+                 body_crop = raw_frame[max(0, by1):min(h, by2), max(0, bx1):min(w, bx2)]
+@@ -107,7 +137,7 @@
+ 
+                     if has_face or valid_body:
+-                        bodies.append(((bx1, by1, bx2, by2), best_face, body_crop.copy(), face_crop))
++                        bodies.append((tid_out, (bx1, by1, bx2, by2), best_face, body_crop.copy(), face_crop))
+         
+         result_coords['bodies'] = bodies
+@@ -176,13 +206,12 @@
+         best_face_id = None
+         min_face_dist = float('inf')
+         
+-        for cid, data in daily_identity_db.items():
+-            if not data['face_features']:
+-                continue
+-            for fv in data['face_features']:
+-                dist = 1 - (np.dot(face_vec, fv) / (np.linalg.norm(face_vec) * np.linalg.norm(fv)))
+-                if dist < min_face_dist:
+-                    min_face_dist = dist
+-                    best_face_id = cid
++        if face_index is not None and face_index.ntotal > 0:
++            query = np.array([face_vec], dtype=np.float32)
++            distances, indices = face_index.search(query, k=1)
++            if indices[0][0] != -1:
++                best_sim = distances[0][0]
++                min_face_dist = 1.0 - best_sim
++                best_face_id = face_id_map[indices[0][0]]
+                     
+         if best_face_id is not None and min_face_dist > STRONG_FACE_DIST:
+@@ -268,11 +297,10 @@
+     best_id = None
+     best_sim = -1.0
+     
+-    for cid, data in daily_identity_db.items():
+-        for known_vec in data['clothes_features']:
+-            sim = np.dot(track_features, known_vec)
+-            if sim > best_sim:
+-                best_sim = sim
+-                best_id = cid
++    if clothes_index is not None and clothes_index.ntotal > 0:
++        query = np.array([track_features], dtype=np.float32)
++        distances, indices = clothes_index.search(query, k=1)
++        if indices[0][0] != -1:
++            best_sim = distances[0][0]
++            best_id = clothes_id_map[indices[0][0]]
+ 
+     # Spatial Clothes Penalty
+@@ -375,34 +403,16 @@
+     detected_bodies = result_coords.get('bodies', [])
+     
+-    for (body_box, face_box, body_crop, face_crop) in detected_bodies:
++    for (matched_tid, body_box, face_box, body_crop, face_crop) in detected_bodies:
+         bx1, by1, bx2, by2 = body_box
+         cv2.rectangle(frame, (bx1, by1), (bx2, by2), (255, 0, 0), 2)
+         if face_box is not None:
+             fx1, fy1, fx2, fy2 = face_box
+             cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (0, 255, 0), 2)
+             
+         cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
+-        matched_tid = None
+-        best_iou = 0.0
+-        min_dist = float('inf')
+-        
+-        for tid, tdata in active_tracks.items():
+-            iou = calculate_iou((bx1, by1, bx2, by2), tdata['box'])
+-            if iou > 0.3 and iou > best_iou:
+-                best_iou, matched_tid = iou, tid
+-
+-        if matched_tid is None:
+-            for tid, tdata in active_tracks.items():
+-                dcx, dcy = tdata['center']
+-                dist = np.sqrt((cx - dcx)**2 + (cy - dcy)**2)
+-                if dist < 60 and dist < min_dist:
+-                    min_dist, matched_tid = dist, tid
+                 
+-        if matched_tid is None:
+-            track_id_counter += 1
+-            matched_tid = track_id_counter
++        if matched_tid not in active_tracks:
+             active_tracks[matched_tid] = {
+                 'center': (cx, cy), 'box': (bx1, by1, bx2, by2),
